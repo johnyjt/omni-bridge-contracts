@@ -163,6 +163,36 @@ contract OmniBridgeVault is ReentrancyGuard, OApp, OAppOptionsType3 {
         emit EndpointConfigured(data);
     }
 
+    function quoteRegisterToken(
+        address token,
+        uint32 dstEid,
+        bytes calldata extraOptions
+    ) external view returns (MessagingFee memory messagingFee, uint256 ethFee, uint256 totalNativeFee) {
+        if (token == address(0)) revert InvalidToken();
+        if (dstEid == 0) revert InvalidToken();
+        if (token.code.length == 0) revert InvalidToken();
+        TokenInfo memory info = tokenInfo[token];
+        if (info.registered && info.isWrapped) revert WrappedTokenCannotRegister();
+
+        (string memory name, string memory symbol, uint8 decimals) = _readMetadata(token);
+        (, , , uint256 ethFee_) = _resolveFeeConfig(token);
+
+        bytes32 originToken = _toBytes32(token);
+        bytes memory payload = abi.encode(
+            localEid,
+            originToken,
+            name,
+            symbol,
+            decimals,
+            bytes32(0)
+        );
+        bytes memory message = abi.encode(MSG_REGISTER, payload);
+        bytes memory options = combineOptions(dstEid, SEND, extraOptions);
+        messagingFee = _quote(dstEid, message, options, false);
+        ethFee = ethFee_;
+        totalNativeFee = messagingFee.nativeFee + ethFee_;
+    }
+
     function registerToken(
         address token,
         uint32 dstEid,
@@ -194,8 +224,45 @@ contract OmniBridgeVault is ReentrancyGuard, OApp, OAppOptionsType3 {
         );
         bytes memory message = abi.encode(MSG_REGISTER, payload);
         bytes memory options = combineOptions(dstEid, SEND, extraOptions);
+        (, , , uint256 ethFee) = _resolveFeeConfig(token);
         MessagingFee memory messagingFee = _quote(dstEid, message, options, false);
+        _setCurrentEthFee(ethFee);
         _lzSend(dstEid, message, options, messagingFee, msg.sender);
+        _clearCurrentEthFee();
+    }
+
+    function quoteSendToken(
+        address token,
+        address to,
+        uint256 amount,
+        uint32 dstEid,
+        bytes calldata extraOptions
+    ) external view returns (MessagingFee memory messagingFee, uint256 ethFee, uint256 totalNativeFee) {
+        if (token == address(0)) revert InvalidToken();
+        if (to == address(0)) revert InvalidToken();
+        if (amount == 0) revert InvalidToken();
+        if (dstEid == 0) revert InvalidToken();
+
+        TokenInfo memory info = tokenInfo[token];
+        if (!info.registered) revert InvalidToken();
+
+        (uint16 feeBps, uint256 maxFee, address feeReceiver, uint256 ethFee_) = _resolveFeeConfig(token);
+        uint256 feeAmount = _computeFee(amount, feeBps, maxFee, feeReceiver);
+        uint256 netAmount = amount - feeAmount;
+        require(netAmount > 0, "net=0");
+
+        bytes memory payload = abi.encode(
+            info.originEid,
+            info.originToken,
+            to,
+            netAmount,
+            bytes32(0)
+        );
+        bytes memory message = abi.encode(MSG_TRANSFER, payload);
+        bytes memory options = combineOptions(dstEid, SEND, extraOptions);
+        messagingFee = _quote(dstEid, message, options, false);
+        ethFee = ethFee_;
+        totalNativeFee = messagingFee.nativeFee + ethFee_;
     }
 
     function sendToken(
@@ -211,11 +278,9 @@ contract OmniBridgeVault is ReentrancyGuard, OApp, OAppOptionsType3 {
         if (dstEid == 0) revert InvalidToken();
 
         TokenInfo memory info = tokenInfo[token];
-        if (!info.registered) {
-            info = _registerNativeToken(token);
-        }
+        if (!info.registered) revert InvalidToken();
 
-        (uint256 feeAmount, uint256 netAmount, address feeReceiver, uint256 ethFee) =
+        (, uint256 netAmount, , uint256 ethFee) =
             _takeTokenFee(token, amount, info.isWrapped);
 
         uint64 nonce = nextNonce++;
